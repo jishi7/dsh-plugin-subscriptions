@@ -12,7 +12,7 @@ import assert from 'node:assert/strict'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { OAuthEndpointError } from '../src/providers/common.js'
 import type { ProviderUsage } from '../src/providers/common.js'
-import { PoolUsageTracker } from '../src/providers/pool-usage.js'
+import { normalizedWindowUrgency, PoolUsageTracker } from '../src/providers/pool-usage.js'
 import type { ProviderId } from '../src/auth/store.js'
 
 const MEMBER = { provider: 'claude' as const, account: 'a1', model: 'claude-opus-5' }
@@ -164,8 +164,119 @@ test('snapshotFor: the stale snapshot is carried across consecutive failure cool
   assert.equal(calls.count, 4)
 })
 
+for (const used of [94.99, 95, 99.99, 100, 105]) {
+  test(`quotaFor: raw ${used}% distinguishes near-full from exhausted`, async () => {
+    const { tracker } = trackerOf(async () => ({ supported: true, windows: [{ kind: 'weekly', usedPercent: used }] }))
+    const quota = await tracker.quotaFor(MEMBER)
+    assert.equal(quota.available, used < 95)
+    assert.equal(quota.exhausted === true, used >= 100)
+  })
+}
+
+test('quotaFor: exhaustion applies only to the requested model, even after a fetch failure', async () => {
+  let fail = false
+  const { tracker } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [
+      { kind: 'weekly', scope: 'opus', usedPercent: 100, resetsAt: Date.now() - 1000 },
+      { kind: 'weekly', scope: 'sonnet', usedPercent: 20 },
+    ] }
+  })
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true, 'reset timestamp alone does not confirm a reset')
+  assert.equal((await tracker.quotaFor({ ...MEMBER, model: 'claude-sonnet-5' })).exhausted, undefined)
+  fail = true
+  await tracker.snapshotFor(MEMBER.provider, MEMBER.account, true)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal((await tracker.quotaFor({ ...MEMBER, model: 'claude-sonnet-5' })).exhausted, undefined)
+})
+
+test('quotaFor: exhausted snapshot awaits expired refresh and restores routing on the same call', async () => {
+  let finish: ((usage: ProviderUsage) => void) | undefined
+  let reads = 0
+  const { tracker, calls } = trackerOf(async () => {
+    if (++reads === 1) return { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }] }
+    return new Promise<ProviderUsage>(resolve => { finish = resolve })
+  }, 0)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  const pending = tracker.quotaFor(MEMBER)
+  const duplicate = tracker.quotaFor(MEMBER)
+  assert.equal(calls.count, 2, 'concurrent reads share the recovery fetch')
+  assert.ok(finish)
+  finish(OK_USAGE)
+  assert.equal((await pending).available, true)
+  assert.equal((await duplicate).exhausted, undefined)
+})
+
+test('quotaFor: exhausted status survives consecutive usage failures and their cooldowns', async () => {
+  let fail = false
+  const { tracker, calls } = trackerOf(async () => {
+    if (fail) throw new OAuthEndpointError('limited', 429, undefined, 60_000)
+    return { supported: true, windows: [{ kind: 'weekly', usedPercent: 100 }] }
+  }, 0)
+  await tracker.quotaFor(MEMBER)
+  fail = true
+  const failed = await tracker.quotaFor(MEMBER)
+  assert.equal(failed.exhausted, true)
+  assert.equal(failed.urgency, 0)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal(calls.count, 2, 'live cooldown is respected')
+})
+
+test('quotaFor: inference invalidation preserves exhausted model lanes through failed refresh', async () => {
+  let fail = false
+  const { tracker, calls } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [{ kind: 'weekly', scope: 'opus', usedPercent: 100 }] }
+  })
+  await tracker.quotaFor(MEMBER)
+  tracker.expire(MEMBER.provider, MEMBER.account)
+  fail = true
+  assert.equal((await tracker.quotaFor({ ...MEMBER, model: 'claude-sonnet-5' })).exhausted, undefined)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  tracker.expire(MEMBER.provider, MEMBER.account)
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  assert.equal(calls.count, 2, 'inference expiration does not bypass the usage-endpoint cooldown')
+})
+
+test('quotaFor: repeated failed recovery attempts retain exhaustion until a successful lookup', async () => {
+  let used = 100
+  let fail = false
+  const { tracker } = trackerOf(async () => {
+    if (fail) throw new Error('offline')
+    return { supported: true, windows: [{ kind: 'weekly', usedPercent: used }] }
+  }, 0)
+  await tracker.quotaFor(MEMBER)
+  fail = true
+  for (let i = 0; i < 3; i++) assert.equal((await tracker.quotaFor(MEMBER)).exhausted, true)
+  fail = false
+  used = 0
+  assert.equal((await tracker.quotaFor(MEMBER)).exhausted, undefined)
+})
+
 test('snapshotFor: a rate limit with no prior success still throws (nothing to fall back to)', async () => {
   const error = new OAuthEndpointError('claude usage token endpoint error (HTTP 429)', 429, undefined, 60_000)
   const { tracker } = trackerOf(() => Promise.reject(error))
   await assert.rejects(tracker.snapshotFor('claude', 'a1'), error)
+})
+
+test('normalized urgency uses total duration, never guesses from time to reset', () => {
+  const hour = 3600000
+  const now = 1_800_000_000_000
+  const score = (duration: number | undefined, left: number, used = 0) => normalizedWindowUrgency({
+    kind: 'other', usedPercent: used, resetsAt: now + left,
+    ...(duration === undefined ? {} : { durationMs: duration }),
+  }, now)
+  for (const length of [3, 5, 7 * 24]) {
+    assert.equal(score(length * hour, length * hour), 1)
+    assert.equal(score(length * hour, length * hour / 2), 2)
+  }
+  const scores = [-1, 0, 1].map(ms => score(24 * hour, 6 * hour + ms))
+  assert.equal(scores[1], 4)
+  assert.ok(scores[0] > scores[1] && scores[1] > scores[2] && scores[0] - scores[2] < 0.000001)
+  for (const duration of [undefined, 0, NaN, Infinity]) {
+    for (const left of [-1, 6 * hour - 1, 6 * hour + 1]) assert.equal(score(duration, left, 25), 0.75)
+  }
+  assert.equal(normalizedWindowUrgency({kind: 'other', usedPercent: 25, durationMs: hour}, now), 0.75)
+  assert.equal(score(hour, -1), 1000)
+  assert.equal(score(hour, -1, 100), 0)
 })
